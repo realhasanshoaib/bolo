@@ -1,348 +1,129 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import {
-  ActivityIndicator,
-  Modal,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-  useWindowDimensions,
-} from 'react-native';
-import * as Clipboard from 'expo-clipboard';
-import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { spacing } from '../constants/theme';
-import { buildDebugReportText, type DisplayTranscriptSegment, type ProcessingDebugReport } from '../lib/syncedTranscript';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
+import type { DisplayTranscriptSegment } from '../lib/syncedTranscript';
+import { findActiveSentence } from '../lib/readerPlayback';
+import { ScrollInteractionBoundary } from './ScrollInteractionBoundary';
+import type { palette } from '../constants/theme';
 
-type SyncedVideoPlayerProps = {
-  activeMs: number;
-  colors: {
-    accent: string;
-    background: string;
-    backgroundAccent: string;
-    border: string;
-    info: string;
-    reader: string;
-    surface: string;
-    text: string;
-    textSoft: string;
-  };
-  debugReport?: ProcessingDebugReport;
-  emptyTranscriptContent?: React.ReactNode;
-  onSeek: (timeMs: number) => void;
-  segments: DisplayTranscriptSegment[];
-  topLeftControls?: React.ReactNode;
-  topRightControls?: React.ReactNode;
-  videoSlot?: React.ReactNode;
-};
+export type ReaderColors = (typeof palette)['light'] | (typeof palette)['dark'];
 
-const formatClock = (timeMs: number) => {
-  const totalSeconds = Math.max(0, Math.floor(timeMs / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-
-  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-};
-
-export function SyncedVideoPlayer({
-  activeMs,
-  colors,
-  debugReport,
-  emptyTranscriptContent,
-  onSeek,
-  segments,
-  topLeftControls,
-  topRightControls,
-  videoSlot,
-}: SyncedVideoPlayerProps) {
-  const { height, width } = useWindowDimensions();
-  const [debugVisible, setDebugVisible] = useState(false);
-  const scrollRef = useRef<ScrollView | null>(null);
-  const landscape = width > height;
-  const activeSegmentIndex = Math.max(
-    0,
-    segments.findIndex((segment) => activeMs >= segment.startMs && activeMs < segment.endMs),
+const Sentence = memo(function Sentence({ segment, active, colors, fontSize, onSeek }: {
+  segment: DisplayTranscriptSegment; active: boolean; colors: ReaderColors;
+  fontSize: number; onSeek: (timeMs: number) => void;
+}) {
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel={segment.translatedText || segment.originalText}
+      accessibilityHint="Play this sentence" accessibilityState={{ selected: active }}
+      onPress={() => onSeek(segment.startMs)}
+      style={[styles.sentence, { backgroundColor: active ? colors.backgroundAccent : colors.background,
+        borderLeftColor: active ? colors.accent : 'transparent' }]}>
+      <Text style={{ color: colors.text, fontSize, lineHeight: Math.round(fontSize * 1.55),
+        fontWeight: active ? '600' : '400', writingDirection: 'auto' }}>
+        {segment.translatedText || segment.originalText}
+      </Text>
+    </Pressable>
   );
+});
 
-  const debugText = useMemo(
-    () => (debugReport ? buildDebugReportText(debugReport) : ''),
-    [debugReport],
-  );
+const Transcript = memo(function Transcript({ activeIndex, colors, fontSize, focusMode, segments, onSeek }: {
+  activeIndex: number; colors: ReaderColors; fontSize: number; focusMode: boolean;
+  segments: DisplayTranscriptSegment[]; onSeek: (timeMs: number) => void;
+}) {
+  const list = useRef<FlatList<DisplayTranscriptSegment>>(null);
+  const [following, setFollowing] = useState(true);
+  const retry = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryCount = useRef(0);
+  const targetIndex = useRef(activeIndex);
+  targetIndex.current = activeIndex;
+  const follow = useCallback(() => {
+    if (targetIndex.current >= 0) list.current?.scrollToIndex({ index: targetIndex.current, viewPosition: 0.2, animated: true });
+  }, []);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({
-      animated: true,
-      y: Math.max(0, activeSegmentIndex * (landscape ? 74 : 92) - 24),
-    });
-  }, [activeSegmentIndex, landscape]);
+    retryCount.current = 0;
+    if (following && !focusMode) follow();
+    return () => { if (retry.current) clearTimeout(retry.current); };
+  }, [activeIndex, following, focusMode, fontSize, follow]);
 
-  const renderSegment = (segment: DisplayTranscriptSegment, index: number) => {
-    const active = index === activeSegmentIndex;
+  const renderItem = useCallback(({ item, index }: { item: DisplayTranscriptSegment; index: number }) => (
+    <Sentence segment={item} active={index === activeIndex} colors={colors} fontSize={fontSize} onSeek={onSeek} />
+  ), [activeIndex, colors, fontSize, onSeek]);
 
+  if (focusMode) {
+    const current = segments[activeIndex];
     return (
-      <Pressable
-        key={`${segment.index}-${segment.startMs}`}
-        onPress={() => onSeek(segment.startMs)}
-        style={[
-          styles.segment,
-          {
-            backgroundColor: active ? colors.backgroundAccent : 'transparent',
-            borderColor: active ? colors.accent : colors.border,
-            borderLeftColor: active ? colors.accent : 'transparent',
-          },
-        ]}
-      >
-        <Text style={[styles.segmentTime, { color: active ? colors.accent : colors.textSoft }]}>
-          {formatClock(segment.startMs)}
-        </Text>
-        <Text style={[styles.translationText, { color: colors.text }]}>
-          {segment.translatedText || segment.originalText}
-        </Text>
-      </Pressable>
+      <FlatList key={`focus-${current?.index ?? 'waiting'}`} data={current ? segments.slice(activeIndex, activeIndex + 2) : segments.slice(0, 1)}
+        keyExtractor={(segment) => String(segment.index)}
+        renderItem={({ item }) => <Sentence segment={item} active={item.index === current?.index}
+          colors={colors} fontSize={fontSize} onSeek={onSeek} />}
+        contentContainerStyle={styles.transcript} />
     );
-  };
-
-  const player = (
-    <View style={[styles.playerPanel, { backgroundColor: colors.background }]}>
-      {videoSlot ?? (
-        <View style={[styles.videoPlaceholder, { backgroundColor: colors.backgroundAccent }]}>
-          <MaterialCommunityIcons name="youtube" size={48} color={colors.accent} />
-          <Text style={[styles.videoPlaceholderText, { color: colors.text }]}>YouTube Player</Text>
-        </View>
-      )}
-    </View>
-  );
-
-  const transcript = (
-    <View style={styles.transcriptPanel}>
-      {segments.length > 0 ? (
-        <ScrollView ref={scrollRef} contentContainerStyle={styles.segmentList} showsVerticalScrollIndicator={false}>
-          {segments.map(renderSegment)}
-        </ScrollView>
-      ) : (
-        emptyTranscriptContent ?? (
-          <View style={styles.emptyTranscript}>
-            <ActivityIndicator color={colors.accent} size="large" />
-            <Text style={[styles.emptyTranscriptTitle, { color: colors.text }]}>Preparing translation...</Text>
-          </View>
-        )
-      )}
-    </View>
-  );
-
-  const controlRow = (
-    <View style={styles.controlRow}>
-      <View>{topLeftControls}</View>
-      <View style={styles.controlRowRight}>
-        {topRightControls}
-        {debugReport ? (
-          <Pressable
-            onPress={() => setDebugVisible(true)}
-            style={[styles.controlIconButton, { borderColor: colors.border, backgroundColor: colors.surface }]}
-          >
-            <MaterialCommunityIcons name="information-outline" size={20} color={colors.text} />
-          </Pressable>
-        ) : null}
-      </View>
-    </View>
-  );
+  }
 
   return (
-    <View
-      style={[
-        styles.container,
-        landscape ? styles.landscapeContainer : styles.portraitContainer,
-        { backgroundColor: colors.background },
-      ]}
-    >
-      {landscape ? (
-        <>
-          <View style={styles.landscapePlayer}>{player}</View>
-          <View style={styles.landscapeTranscript}>
-            {controlRow}
-            {transcript}
-          </View>
-        </>
-      ) : (
-        <>
-          {controlRow}
-          {player}
-          {transcript}
-        </>
-      )}
+    <ScrollInteractionBoundary onManualScroll={() => {
+      setFollowing(false);
+      if (retry.current) clearTimeout(retry.current);
+    }}>
+    <View style={styles.fill}>
+      <FlatList ref={list} data={segments} renderItem={renderItem} extraData={activeIndex}
+        keyExtractor={(segment) => String(segment.index)} contentContainerStyle={styles.transcript}
+        initialNumToRender={12} maxToRenderPerBatch={12} windowSize={7}
+        onScrollBeginDrag={() => {
+          setFollowing(false);
+          if (retry.current) clearTimeout(retry.current);
+        }}
+        onScrollToIndexFailed={({ averageItemLength, index }) => {
+          // Move the render window near an unmeasured row, then seek its measured
+          // layout. Never treat a fixed sentence height as the final position.
+          if (!following) return;
+          if (retryCount.current >= 3) { setFollowing(false); return; }
+          retryCount.current += 1;
+          list.current?.scrollToOffset({ offset: averageItemLength * index, animated: false });
+          retry.current = setTimeout(follow, 150);
+        }} />
+      {!following && <Pressable accessibilityRole="button" onPress={() => setFollowing(true)}
+        style={[styles.followButton, { backgroundColor: colors.surface, borderColor: colors.accent }]}>
+        <Text style={{ color: colors.text, fontSize: 18 }}>Follow video</Text>
+      </Pressable>}
+    </View>
+    </ScrollInteractionBoundary>
+  );
+});
 
-      <Modal transparent animationType="fade" visible={debugVisible}>
-        <View style={styles.modalBackdrop}>
-          <View style={[styles.debugSheet, { backgroundColor: colors.reader, borderColor: colors.border }]}>
-            <View style={styles.titleRow}>
-              <Text style={[styles.debugTitle, { color: colors.text }]}>Processing Info</Text>
-              <Pressable onPress={() => setDebugVisible(false)} style={styles.closeButton}>
-                <MaterialCommunityIcons name="close" size={24} color={colors.text} />
-              </Pressable>
-            </View>
-            <ScrollView style={styles.debugScroll}>
-              <Text selectable style={[styles.debugText, { color: colors.text }]}>
-                {debugText}
-              </Text>
-            </ScrollView>
-            <Pressable
-              onPress={() => Clipboard.setStringAsync(debugText)}
-              style={[styles.copyButton, { backgroundColor: colors.info, borderColor: colors.border }]}
-            >
-              <MaterialCommunityIcons name="content-copy" size={20} color="#fff" />
-              <Text style={styles.copyButtonText}>Copy debug report</Text>
-            </Pressable>
-          </View>
+export function SyncedVideoPlayer({ activeMs, colors, emptyTranscriptContent, onSeek, segments,
+  topLeftControls, topRightControls, videoSlot, fontSize, focusMode, readingControls, statusContent }: {
+  activeMs: number; colors: ReaderColors; emptyTranscriptContent?: React.ReactNode;
+  onSeek: (timeMs: number) => void; segments: DisplayTranscriptSegment[];
+  topLeftControls?: React.ReactNode; topRightControls?: React.ReactNode; videoSlot?: React.ReactNode;
+  fontSize: number; focusMode: boolean; readingControls: React.ReactNode; statusContent?: React.ReactNode;
+}) {
+  const { height, width } = useWindowDimensions();
+  const landscape = width > height;
+  const activeIndex = findActiveSentence(segments, activeMs);
+  const transcript = segments.length ? <Transcript activeIndex={activeIndex} colors={colors} fontSize={fontSize}
+    focusMode={focusMode} segments={segments} onSeek={onSeek} /> : emptyTranscriptContent ?? <ActivityIndicator />;
+  return (
+    <View style={[styles.fill, { backgroundColor: colors.background }]}>
+      <View style={styles.topBar}>{topLeftControls}{topRightControls}</View>
+      <View style={[styles.fill, landscape && styles.landscape]}>
+        <View style={landscape ? styles.videoLandscape : undefined}>{videoSlot}</View>
+        <View style={styles.fill}>
+          {readingControls}
+          {statusContent}
+          {transcript}
         </View>
-      </Modal>
+      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  closeButton: {
-    alignItems: 'center',
-    height: 42,
-    justifyContent: 'center',
-    width: 42,
-  },
-  container: {
-    flex: 1,
-  },
-  controlIconButton: {
-    alignItems: 'center',
-    borderRadius: 10,
-    borderWidth: 1,
-    height: 38,
-    justifyContent: 'center',
-    width: 38,
-  },
-  controlRow: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    minHeight: 44,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 3,
-  },
-  controlRowRight: {
-    flexDirection: 'row',
-    gap: spacing.xs,
-  },
-  copyButton: {
-    alignItems: 'center',
-    borderRadius: 16,
-    borderWidth: 3,
-    flexDirection: 'row',
-    gap: 8,
-    justifyContent: 'center',
-    minHeight: 58,
-  },
-  copyButtonText: {
-    color: '#fff',
-    fontSize: 17,
-    fontWeight: '900',
-  },
-  debugScroll: {
-    maxHeight: 320,
-  },
-  debugSheet: {
-    borderRadius: 20,
-    borderWidth: 3,
-    gap: spacing.md,
-    maxWidth: 560,
-    padding: spacing.md,
-    width: '92%',
-  },
-  debugText: {
-    fontSize: 15,
-    fontWeight: '600',
-    lineHeight: 23,
-  },
-  debugTitle: {
-    fontSize: 24,
-    fontWeight: '900',
-  },
-  emptyTranscript: {
-    alignItems: 'center',
-    flex: 1,
-    gap: spacing.sm,
-    justifyContent: 'center',
-    padding: spacing.lg,
-  },
-  emptyTranscriptTitle: {
-    fontSize: 18,
-    fontWeight: '800',
-    textAlign: 'center',
-  },
-  landscapeContainer: {
-    flexDirection: 'row',
-  },
-  landscapePlayer: {
-    flex: 1.3,
-    minWidth: 0,
-  },
-  landscapeTranscript: {
-    flex: 1,
-    minWidth: 0,
-  },
-  modalBackdrop: {
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.55)',
-    flex: 1,
-    justifyContent: 'center',
-    padding: spacing.md,
-  },
-  playerPanel: {
-    gap: spacing.xs,
-    overflow: 'hidden',
-  },
-  portraitContainer: {
-    paddingHorizontal: 0,
-  },
-  segment: {
-    borderLeftWidth: 4,
-    borderRadius: 6,
-    borderWidth: 0,
-    gap: 2,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 6,
-  },
-  segmentList: {
-    gap: 2,
-    paddingBottom: spacing.md,
-    paddingTop: spacing.xs,
-  },
-  segmentTime: {
-    fontSize: 12,
-    fontWeight: '900',
-  },
-  titleRow: {
-    alignItems: 'flex-start',
-    flexDirection: 'row',
-    gap: spacing.sm,
-    justifyContent: 'space-between',
-  },
-  transcriptPanel: {
-    flex: 1,
-    minHeight: 0,
-    paddingHorizontal: spacing.sm,
-  },
-  translationText: {
-    fontSize: 16,
-    fontWeight: '700',
-    lineHeight: 23,
-  },
-  videoPlaceholder: {
-    alignItems: 'center',
-    aspectRatio: 16 / 9,
-    borderRadius: 12,
-    gap: 6,
-    justifyContent: 'center',
-    width: '100%',
-  },
-  videoPlaceholderText: {
-    fontSize: 18,
-    fontWeight: '900',
-  },
+  fill: { flex: 1, minHeight: 0, minWidth: 0 },
+  landscape: { flexDirection: 'row' },
+  videoLandscape: { flex: 1.3, justifyContent: 'center' },
+  topBar: { flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 4 },
+  transcript: { paddingVertical: 12, paddingBottom: 32 },
+  sentence: { paddingHorizontal: 16, paddingVertical: 12, borderLeftWidth: 4, minHeight: 52 },
+  followButton: { alignSelf: 'center', borderWidth: 1, borderRadius: 14, padding: 14, margin: 8, minHeight: 48 },
 });

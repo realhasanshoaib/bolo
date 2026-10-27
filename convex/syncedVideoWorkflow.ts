@@ -1,23 +1,18 @@
 import { v } from 'convex/values';
-import { Effect } from 'effect';
+import { Effect, Either } from 'effect';
 import { internal } from './_generated/api';
 import { workflow } from './workflow';
 import {
   buildTranslationBatches,
+  indexChunkSegments,
   mergeTranscriptSegments,
   type DisplayTranscriptSegment,
   type RawTranscriptSegment,
 } from '../src/lib/syncedTranscript';
 
-const translatedBatchToSegments = (
-  batches: {
-    segments: DisplayTranscriptSegment[];
-  }[],
-) => batches.flatMap((batch) => batch.segments).sort((left, right) => left.index - right.index);
-
-const WHISPER_CONCURRENCY = 8;
+const CHUNK_CONCURRENCY = 6;
 const TRANSLATION_BATCH_MAX_CHARS = 900;
-const TRANSLATION_CONCURRENCY = 6;
+
 
 export const processSyncedVideo = workflow
   .define({
@@ -73,60 +68,10 @@ export const processSyncedVideo = workflow
       await step.runMutation(internal.entries.updateProgress, {
         attemptId: args.attemptId,
         entryId: args.entryId,
-        processingStage: 'Transcribing timed audio chunks',
+        processingStage: 'Adding your translation',
         updatedAt: Date.now(),
       });
 
-      const transcriptChunks = await Effect.runPromise(
-        Effect.all(
-          prepared.chunks.map((chunk) =>
-            Effect.tryPromise({
-              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-              try: () =>
-                step.runAction(
-                  internal.syncPipeline.transcribeChunk,
-                  {
-                    attemptId: args.attemptId,
-                    chunkDurationMs: chunk.durationMs,
-                    chunkIndex: chunk.index,
-                    chunkStartMs: chunk.startMs,
-                    entryId: args.entryId,
-                    language: entry.sourceLanguage !== 'auto' ? entry.sourceLanguage : undefined,
-                    r2Key: chunk.r2Key,
-                  },
-                  { retry: { base: 2, initialBackoffMs: 5_000, maxAttempts: 3 } },
-                ),
-            }),
-          ),
-          { concurrency: WHISPER_CONCURRENCY },
-        ),
-      );
-
-      const rawSegments: RawTranscriptSegment[] = transcriptChunks.flatMap((chunk) =>
-        chunk.segments.map((segment) => ({
-          chunkIndex: chunk.chunkIndex,
-          endMs: segment.endMs,
-          startMs: segment.startMs,
-          text: segment.text,
-        })),
-      );
-      const mergedSegments = mergeTranscriptSegments({ segments: rawSegments });
-
-      if (mergedSegments.length === 0) {
-        throw new Error('Whisper did not return usable timed transcript segments.');
-      }
-
-      await step.runMutation(internal.entries.updateProgress, {
-        attemptId: args.attemptId,
-        entryId: args.entryId,
-        processingStage: 'Translating timed transcript',
-        updatedAt: Date.now(),
-      });
-
-      const translationBatches = buildTranslationBatches({
-        maxChars: TRANSLATION_BATCH_MAX_CHARS,
-        segments: mergedSegments,
-      });
       const translateSegmentsWithFallback = async (
         batchSegments: DisplayTranscriptSegment[],
       ): Promise<{
@@ -143,7 +88,7 @@ export const processSyncedVideo = workflow
               sourceLanguageLabel: entry.sourceLanguageLabel,
               targetLanguageLabel: entry.targetLanguageLabel,
             },
-            { retry: { base: 2, initialBackoffMs: 3_000, maxAttempts: 3 } },
+            { retry: { base: 2, initialBackoffMs: 1_000, maxAttempts: 2 } },
           );
         } catch (error) {
           if (batchSegments.length <= 1) {
@@ -151,10 +96,8 @@ export const processSyncedVideo = workflow
           }
 
           const splitIndex = Math.ceil(batchSegments.length / 2);
-          const [left, right] = await Promise.all([
-            translateSegmentsWithFallback(batchSegments.slice(0, splitIndex)),
-            translateSegmentsWithFallback(batchSegments.slice(splitIndex)),
-          ]);
+          const left = await translateSegmentsWithFallback(batchSegments.slice(0, splitIndex));
+          const right = await translateSegmentsWithFallback(batchSegments.slice(splitIndex));
 
           return {
             elapsedSec: left.elapsedSec + right.elapsedSec,
@@ -162,38 +105,63 @@ export const processSyncedVideo = workflow
           };
         }
       };
-      const translatedBatches = await Effect.runPromise(
-        Effect.all(
-          translationBatches.map((batch) =>
-            Effect.tryPromise({
-              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-              try: () => {
-                const indexes = new Set(batch.map((item) => Number(item.id)));
-                const batchSegments = mergedSegments.filter((segment) => indexes.has(segment.index));
-
-                return translateSegmentsWithFallback(batchSegments);
-              },
-            }),
-          ),
-          { concurrency: TRANSLATION_CONCURRENCY },
-        ),
-      );
-      const translatedSegments = translatedBatchToSegments(translatedBatches);
-      const now = Date.now();
-      const totalSec = (now - startedAt) / 1000;
-      const whisperSec = transcriptChunks.reduce((total, chunk) => total + chunk.elapsedSec, 0);
-      const translationSec = translatedBatches.reduce((total, batch) => total + batch.elapsedSec, 0);
-
+      // Each worker transcribes, translates, and publishes one chunk. Sequential
+      // batches inside a worker keep provider concurrency bounded across the job.
       await step.runMutation(internal.entries.replaceEntrySegments, {
-        attemptId: args.attemptId,
-        createdAt: now,
-        entryId: args.entryId,
-        segments: translatedSegments,
+        attemptId: args.attemptId, entryId: args.entryId, createdAt: Date.now(), segments: [],
       });
+      const chunkOutcomes = await Effect.runPromise(Effect.all(
+        prepared.chunks.map((chunk) => Effect.tryPromise({
+          catch: (error) => error instanceof Error ? error : new Error(String(error)),
+          try: async () => {
+            const transcript = await step.runAction(internal.syncPipeline.transcribeChunk, {
+              attemptId: args.attemptId,
+              chunkDurationMs: chunk.durationMs,
+              chunkIndex: chunk.index,
+              chunkStartMs: chunk.startMs,
+              entryId: args.entryId,
+              language: entry.sourceLanguage !== 'auto' ? entry.sourceLanguage : undefined,
+              r2Key: chunk.r2Key,
+            }, { retry: { base: 2, initialBackoffMs: 3_000, maxAttempts: 3 } });
+            const rawSegments: RawTranscriptSegment[] = transcript.segments.map((segment) => ({
+              chunkIndex: transcript.chunkIndex, endMs: segment.endMs,
+              startMs: segment.startMs, text: segment.text,
+            }));
+            const mergedSegments = mergeTranscriptSegments({ segments: rawSegments });
+            const indexedSegments = indexChunkSegments(chunk.index, mergedSegments);
+            const batches = buildTranslationBatches({ maxChars: TRANSLATION_BATCH_MAX_CHARS, segments: indexedSegments });
+            let translationSec = 0;
+            for (const batch of batches) {
+              const indexes = new Set(batch.map((item) => Number(item.id)));
+              const translated = await translateSegmentsWithFallback(indexedSegments.filter((segment) => indexes.has(segment.index)));
+              translationSec += translated.elapsedSec;
+              await step.runMutation(internal.entries.publishEntrySegments, {
+                attemptId: args.attemptId, entryId: args.entryId,
+                createdAt: Date.now(), segments: translated.segments,
+              });
+            }
+            await step.runMutation(internal.entries.completeTranslationChunk, {
+              attemptId: args.attemptId, entryId: args.entryId, chunkIndex: chunk.index, createdAt: Date.now(),
+            });
+            return { whisperSec: transcript.elapsedSec, translationSec, segmentCount: indexedSegments.length };
+          },
+        })),
+        { concurrency: CHUNK_CONCURRENCY, mode: "either" },
+      ));
+      const chunkResults = chunkOutcomes.map((outcome) => {
+        if (Either.isLeft(outcome)) throw outcome.left;
+        return outcome.right;
+      });
+      if (!chunkResults.some((chunk) => chunk.segmentCount > 0)) {
+        throw new Error('We could not find spoken words in this video.');
+      }
+      const whisperSec = chunkResults.reduce((total, chunk) => total + chunk.whisperSec, 0);
+      const translationSec = chunkResults.reduce((total, chunk) => total + chunk.translationSec, 0);
+
       await step.runMutation(internal.entries.updateProgress, {
         attemptId: args.attemptId,
         entryId: args.entryId,
-        processingStage: 'Cleaning up temporary audio',
+        processingStage: 'Finishing up',
         updatedAt: Date.now(),
       });
       await step.runAction(
@@ -205,12 +173,15 @@ export const processSyncedVideo = workflow
         },
         { retry: { base: 2, initialBackoffMs: 3_000, maxAttempts: 3 } },
       );
+      const now = Date.now();
+      const totalSec = (now - startedAt) / 1000;
       await step.runMutation(internal.entries.completeProcessingRun, {
         attemptId: args.attemptId,
         completedAt: now,
         downloadSec: prepared.downloadSec,
         entryId: args.entryId,
         ffmpegSec: prepared.ffmpegSec,
+        uploadSec: "uploadSec" in prepared ? prepared.uploadSec : undefined,
         realtimeFactor: prepared.durationSec > 0 ? prepared.durationSec / Math.max(totalSec, 1) : undefined,
         totalSec,
         translationSec,
@@ -220,7 +191,7 @@ export const processSyncedVideo = workflow
         attemptId: args.attemptId,
         durationSec: prepared.durationSec,
         entryId: args.entryId,
-        processingStage: 'Ready for synced playback',
+        processingStage: 'Ready to watch',
         updatedAt: now,
       });
 

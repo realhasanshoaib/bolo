@@ -19,6 +19,12 @@ export type YouTubeVideoSlotProps = {
   onTimeChange: (timeMs: number) => void;
   seekRequestMs: number | null;
   videoId: string;
+  seekRequestSequence: number;
+  playing: boolean;
+  playbackRate: number;
+  onPlaybackRateChange: (rate: number) => void;
+  onPlaybackRatesChange: (rates: number[]) => void;
+  onReadyChange: (ready: boolean) => void;
 };
 
 export function YouTubeVideoSlot({
@@ -29,6 +35,12 @@ export function YouTubeVideoSlot({
   onTimeChange,
   seekRequestMs,
   videoId,
+  seekRequestSequence,
+  playing,
+  playbackRate,
+  onPlaybackRateChange,
+  onPlaybackRatesChange,
+  onReadyChange,
 }: YouTubeVideoSlotProps) {
   const playerRef = useRef<YoutubeIframeRef | null>(null);
   const { height, width } = useWindowDimensions();
@@ -47,26 +59,35 @@ export function YouTubeVideoSlot({
     }
 
     playerRef.current?.seekTo(seekRequestMs / 1000, true);
-  }, [ready, seekRequestMs]);
+  }, [ready, seekRequestMs, seekRequestSequence]);
 
   useEffect(() => {
-    if (!ready) {
+    if (!ready || !playing) {
       return;
     }
-
+    let cancelled = false;
     const interval = setInterval(() => {
       void playerRef.current?.getCurrentTime().then((seconds) => {
-        onTimeChange(Math.round(seconds * 1000));
+        if (!cancelled) onTimeChange(Math.round(seconds * 1000));
+      }).catch(() => {
+        if (cancelled) return;
+        setReady(false);
+        onReadyChange(false);
+        setError('We could not follow the video position. Please reopen the video.');
+        onError('We could not follow the video position. Please reopen the video.');
       });
     }, 500);
 
-    return () => clearInterval(interval);
-  }, [onTimeChange, ready]);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [onTimeChange, onError, ready, playing, onReadyChange]);
 
   return (
     <View style={styles.container}>
       <YoutubePlayer
         height={playerHeight}
+        play={playing}
+        playbackRate={playbackRate}
+        onPlaybackRateChange={onPlaybackRateChange}
         initialPlayerParams={{
           controls: true,
           preventFullScreen: true,
@@ -77,19 +98,27 @@ export function YouTubeVideoSlot({
             onPlayingChange(true);
           } else if (state === PLAYER_STATES.PAUSED || state === PLAYER_STATES.ENDED) {
             onPlayingChange(false);
+            if (state === PLAYER_STATES.ENDED) onTimeChange(0);
+            else void playerRef.current?.getCurrentTime().then((seconds) => onTimeChange(seconds * 1000))
+              .catch(() => onError('We could not save the paused position. Please reopen the video.'));
           }
         }}
-        onError={(nextError: string) => {
-          const message = `YouTube player error: ${nextError}`;
+        onError={() => {
+          const message = 'This video could not play. Try opening it in YouTube or choose another video.';
           setError(message);
+          onReadyChange(false);
+          onPlayingChange(false);
           onError(message);
         }}
         onReady={() => {
           setReady(true);
+          onReadyChange(true);
           setError(null);
           void playerRef.current?.getDuration().then((seconds) => {
             onDurationChange(Math.round(seconds * 1000));
-          });
+          }).catch(() => onError('We could not read the video length. Please reopen the video.'));
+          void playerRef.current?.getAvailablePlaybackRates().then(onPlaybackRatesChange)
+            .catch(() => onError('Slower playback is unavailable for this video.'));
         }}
         ref={playerRef}
         videoId={videoId}

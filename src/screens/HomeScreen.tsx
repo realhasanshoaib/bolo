@@ -1,9 +1,12 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useState } from 'react';
+import { useDeferredValue, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   AppState,
+  BackHandler,
   Dimensions,
+  Modal,
+  Platform,
   Image,
   Pressable,
   ScrollView,
@@ -18,9 +21,12 @@ import * as Haptics from 'expo-haptics';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { LanguagePickerSheet } from '../components/LanguagePickerSheet';
-import { SyncedVideoPlayer } from '../components/SyncedVideoPlayer';
-import { YouTubeVideoSlot } from '../components/YouTubeVideoSlot';
-import { defaultTargetLanguage, getLanguageLabel, languageOptions } from '../constants/languages';
+import { SyncedReadingScreen } from './SyncedReadingScreen';
+import { VideoLibraryScreen } from './VideoLibraryScreen';
+import { useReadingPreferences } from '../lib/readingPreferences';
+import { useShareIntent } from 'expo-share-intent';
+import Constants from 'expo-constants';
+import { getLanguageLabel, languageOptions } from '../constants/languages';
 import { palette, spacing } from '../constants/theme';
 import {
   fetchYouTubePreview,
@@ -30,9 +36,8 @@ import {
 } from '../lib/youtube';
 import {
   getFriendlyFailureCopy,
-  languagePresets,
 } from '../lib/reader';
-import type { DisplayTranscriptSegment, ProcessingDebugReport } from '../lib/syncedTranscript';
+import { buildDebugReportText, type DisplayTranscriptSegment, type ProcessingDebugReport } from '../lib/syncedTranscript';
 import type { Doc } from '../../convex/_generated/dataModel';
 
 const { width } = Dimensions.get('window');
@@ -41,16 +46,21 @@ const isSmallDevice = width < 375;
 export function HomeScreen({
   backendReady,
   entries,
+  entriesLoading = false,
   isWorking,
   onToggleFavorite,
   onSelectEntry,
   onTranscribe,
   selectedEntryId,
+  selectedEntry,
   syncedDebugReport,
   syncedSegments,
+  supportVisible = false,
+  onSupportVisibleChange,
 }: {
   backendReady: boolean;
   entries: Doc<'entries'>[];
+  entriesLoading?: boolean;
   isWorking: boolean;
   onToggleFavorite: (entryId: Doc<'entries'>['_id']) => Promise<void>;
   onSelectEntry: (entryId: Doc<'entries'>['_id']) => void;
@@ -66,27 +76,54 @@ export function HomeScreen({
     youtubeUrl: string;
   }) => Promise<Doc<'entries'>['_id'] | null>;
   selectedEntryId: Doc<'entries'>['_id'] | null;
+  selectedEntry: Doc<'entries'> | null | undefined;
   syncedDebugReport?: ProcessingDebugReport;
   syncedSegments: DisplayTranscriptSegment[];
+  supportVisible?: boolean;
+  onSupportVisibleChange?: (visible: boolean) => void;
 }) {
   const scheme = useColorScheme();
   const colors = palette[scheme === 'dark' ? 'dark' : 'light'];
-  
+
   const [url, setUrl] = useState('');
-  const [view, setView] = useState<'history' | 'input' | 'reading'>('input');
+  const [view, setView] = useState<'library' | 'input' | 'reading'>('library');
   const [preview, setPreview] = useState<YouTubePreview | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
-  const [targetLanguage, setTargetLanguage] = useState<string>(defaultTargetLanguage.code);
+  const preferences = useReadingPreferences();
+  const { language: targetLanguage, setLanguage: setTargetLanguage } = preferences;
   const [pickerVisible, setPickerVisible] = useState(false);
-  const [historyQuery, setHistoryQuery] = useState('');
-  const [playerActiveMs, setPlayerActiveMs] = useState(0);
-  const [playerDurationMs, setPlayerDurationMs] = useState(0);
-  const [playerSeekRequestMs, setPlayerSeekRequestMs] = useState<number | null>(null);
   const [wasAutoPasted, setWasAutoPasted] = useState(false);
+
+  const { hasShareIntent, shareIntent, resetShareIntent, error: shareError } = useShareIntent({
+    disabled: Platform.OS === 'web' || Constants.appOwnership === 'expo',
+    resetOnBackground: false,
+  });
+  useEffect(() => {
+    if (!hasShareIntent) return;
+    const sharedText = shareIntent.webUrl || shareIntent.text || '';
+    const candidates = [sharedText, ...(sharedText.match(/https?:\/\/[^\s]+/g) ?? [])];
+    const parsed = candidates.map(parseYouTubeUrl).find(Boolean);
+    if (parsed) {
+      setUrl(parsed.cleanUrl);
+      setView('input');
+      setWasAutoPasted(true);
+    } else {
+      Alert.alert('Share a YouTube video', 'This link is not a YouTube video. Open a video in YouTube and share it to Bolo.');
+    }
+    resetShareIntent();
+  }, [hasShareIntent, shareIntent, resetShareIntent]);
+
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (view === 'library') return false;
+      setView('library');
+      return true;
+    });
+    return () => subscription.remove();
+  }, [view]);
 
   const deferredUrl = useDeferredValue(url);
   const parsedUrl = parseYouTubeUrl(url);
-  const selectedEntry = entries.find((entry) => entry._id === selectedEntryId) ?? entries[0] ?? null;
   const targetLanguageOptions = languageOptions.filter((language) => language.code !== 'auto');
 
   useEffect(() => {
@@ -96,6 +133,7 @@ export function HomeScreen({
   }, [entries, onSelectEntry, selectedEntryId]);
 
   useEffect(() => {
+    if (view !== 'input') return;
     const checkClipboard = async () => {
       if (url.trim()) return;
       let content = '';
@@ -116,7 +154,7 @@ export function HomeScreen({
       if (nextState === 'active') void checkClipboard();
     });
     return () => subscription.remove();
-  }, [url, wasAutoPasted]);
+  }, [url, wasAutoPasted, view]);
 
   useEffect(() => {
     const parsed = parseYouTubeUrl(deferredUrl);
@@ -142,20 +180,6 @@ export function HomeScreen({
       clearTimeout(timeout);
     };
   }, [deferredUrl]);
-
-  const filteredEntries = useMemo(() => {
-    const normalizedQuery = historyQuery.trim().toLowerCase();
-    const sorted = [...entries].sort((left, right) => {
-      if (left.favorite === right.favorite) return right.updatedAt - left.updatedAt;
-      return left.favorite ? -1 : 1;
-    });
-    if (!normalizedQuery) return sorted;
-    return sorted.filter((entry) =>
-      [entry.title, entry.channelTitle, entry.targetLanguageLabel]
-        .filter(Boolean)
-        .some((value) => value?.toLowerCase().includes(normalizedQuery)),
-    );
-  }, [entries, historyQuery]);
 
   const failureCopy = getFriendlyFailureCopy(selectedEntry?.errorMessage);
 
@@ -185,21 +209,18 @@ export function HomeScreen({
 
     if (entryId) {
       onSelectEntry(entryId);
+      preferences.rememberEntry(entryId);
       setView('reading');
     }
   };
 
   const handleToggleFavorite = async (entryId: Doc<'entries'>['_id']) => {
-    await onToggleFavorite(entryId);
+    try {
+      await onToggleFavorite(entryId);
+    } catch {
+      Alert.alert('Could not update your saved video', 'Please check your connection and try again.');
+    }
   };
-
-  const handlePlayerSeek = useCallback((timeMs: number) => {
-    const durationMs = Math.max(playerDurationMs, syncedSegments.at(-1)?.endMs ?? 0);
-    const nextTimeMs = Math.max(0, Math.min(timeMs, durationMs || timeMs));
-
-    setPlayerActiveMs(nextTimeMs);
-    setPlayerSeekRequestMs(nextTimeMs);
-  }, [playerDurationMs, syncedSegments]);
 
   const renderReadingView = () => {
     if (!selectedEntry) return null;
@@ -207,87 +228,20 @@ export function HomeScreen({
     const syncedEntry = selectedEntry.processingVersion === 2;
 
     if (syncedEntry) {
-      return (
-        <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background }]}>
-          <SyncedVideoPlayer
-            activeMs={playerActiveMs}
-            colors={colors}
-            debugReport={syncedDebugReport}
-            emptyTranscriptContent={
-              <View style={styles.syncedEmptyState}>
-                {selectedEntry.status === 'failed' ? (
-                  <>
-                    <MaterialCommunityIcons name="alert-circle-outline" size={34} color={colors.danger} />
-                    <Text style={[styles.statusTitle, { color: colors.danger }]}>{failureCopy.title}</Text>
-                    <Text style={[styles.statusBody, { color: colors.textSoft }]}>{failureCopy.body}</Text>
-                    <Pressable
-                      onPress={() => handleReadVideo(selectedEntry)}
-                      style={[styles.inlineActionButton, { backgroundColor: colors.accent, borderColor: colors.border }]}
-                    >
-                      <MaterialCommunityIcons color="#fff" name="refresh" size={18} />
-                      <Text style={styles.inlineActionText}>Try Again</Text>
-                    </Pressable>
-                  </>
-                ) : (
-                  <>
-                    <ActivityIndicator size="large" color={colors.accent} />
-                    <Text style={[styles.statusTitle, { color: colors.text }]}>Preparing synced player...</Text>
-                    <Text style={[styles.statusBody, { color: colors.textSoft }]}>
-                      {selectedEntry.processingStage ?? 'We are preparing the video, transcript, and translation.'}
-                    </Text>
-                  </>
-                )}
-              </View>
-            }
-            onSeek={handlePlayerSeek}
-            segments={syncedSegments}
-            topLeftControls={
-              <Pressable
-                onPress={() => {
-                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                  setView('input');
-                }}
-                style={[styles.compactBackButton, { borderColor: colors.border, backgroundColor: colors.background }]}
-              >
-                <MaterialCommunityIcons name="chevron-left" size={24} color={colors.text} />
-                <Text style={[styles.compactBackText, { color: colors.text }]}>Back</Text>
-              </Pressable>
-            }
-            topRightControls={
-              <Pressable
-                onPress={() => handleToggleFavorite(selectedEntry._id)}
-                style={[styles.compactIconButton, { borderColor: colors.border, backgroundColor: colors.background }]}
-              >
-                <MaterialCommunityIcons
-                  color={selectedEntry.favorite ? colors.accent : colors.textSoft}
-                  name={selectedEntry.favorite ? 'star' : 'star-outline'}
-                  size={22}
-                />
-              </Pressable>
-            }
-            videoSlot={
-              <YouTubeVideoSlot
-                colors={colors}
-                onDurationChange={setPlayerDurationMs}
-                onError={(message) => Alert.alert('Video problem', message)}
-                onPlayingChange={() => undefined}
-                onTimeChange={setPlayerActiveMs}
-                seekRequestMs={playerSeekRequestMs}
-                videoId={selectedEntry.videoId}
-              />
-            }
-          />
-        </SafeAreaView>
-      );
+      return <SyncedReadingScreen key={selectedEntry._id} entry={selectedEntry} segments={syncedSegments}
+        colors={colors} fontSize={preferences.fontSize} focusMode={preferences.focusMode}
+        onFontSizeChange={preferences.setFontSize} onFocusModeChange={preferences.setFocusMode}
+        onBack={() => setView('library')} onFavorite={() => { void handleToggleFavorite(selectedEntry._id); }}
+        onRetry={() => { void handleReadVideo(selectedEntry); }} />;
     }
 
     return (
       <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background }]}>
         <View style={[styles.header, { borderBottomWidth: 1, borderColor: colors.border }]}>
-          <Pressable
+          <Pressable accessibilityRole="button"
             onPress={() => {
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-              setView('input');
+              setView('library');
             }}
             style={styles.backButton}
           >
@@ -296,7 +250,7 @@ export function HomeScreen({
           </Pressable>
 
           <View style={styles.readerHeaderTools}>
-            <Pressable
+            <Pressable accessibilityRole="button"
               onPress={() => handleToggleFavorite(selectedEntry._id)}
               style={[styles.headerIconBtn, { borderColor: colors.border }]}
             >
@@ -317,7 +271,7 @@ export function HomeScreen({
                 <Text style={[styles.statusBody, { color: colors.textSoft }]}>
                   {failureCopy.body}
                 </Text>
-                <Pressable
+                <Pressable accessibilityRole="button"
                   onPress={() => handleReadVideo(selectedEntry)}
                   style={[styles.inlineActionButton, { backgroundColor: colors.accent, borderColor: colors.border }]}
                 >
@@ -328,9 +282,9 @@ export function HomeScreen({
             ) : (
               <>
                 <ActivityIndicator size="large" color={colors.accent} />
-                <Text style={[styles.statusTitle, { color: colors.text }]}>Preparing synced player...</Text>
+                <Text style={[styles.statusTitle, { color: colors.text }]}>Getting your video ready</Text>
                 <Text style={[styles.statusBody, { color: colors.textSoft }]}>
-                  {selectedEntry.processingStage ?? 'We are preparing the video, transcript, and translation.'}
+                  Adding your translation. You can come back to this video later.
                 </Text>
               </>
             )}
@@ -339,269 +293,197 @@ export function HomeScreen({
     );
   };
 
-  const renderHistoryView = () => (
-    <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background }]}>
-      <View style={[styles.header, { borderBottomWidth: 3, borderColor: colors.border }]}>
-        <Pressable onPress={() => setView('input')} style={styles.backButton}>
-          <MaterialCommunityIcons name="chevron-left" size={34} color={colors.text} />
-          <Text style={[styles.backText, { color: colors.text }]}>Back</Text>
-        </Pressable>
-        <Text style={[styles.headerTitle, { color: colors.text }]}>History</Text>
-      </View>
+  const openSavedVideo = (entry: Doc<'entries'>) => {
+    if (entry.processingVersion !== 2) {
+      void handleReadVideo(entry);
+      return;
+    }
+    onSelectEntry(entry._id);
+    preferences.rememberEntry(entry._id);
+    setView('reading');
+  };
 
-      <ScrollView contentContainerStyle={styles.historyContent} showsVerticalScrollIndicator={false}>
-        <TextInput
-          autoCorrect={false}
-          onChangeText={setHistoryQuery}
-          placeholder="Search your saved videos..."
-          placeholderTextColor={colors.textSoft}
-          style={[
-            styles.historySearch,
-            { backgroundColor: colors.surface, borderColor: colors.border, color: colors.text },
-          ]}
-          value={historyQuery}
-        />
-
-        {filteredEntries.length === 0 ? (
-          <View style={styles.emptyContainer}>
-            <MaterialCommunityIcons name="book-open-outline" size={72} color={colors.textSoft} />
-            <Text style={[styles.emptyText, { color: colors.textSoft }]}>Nothing matches that search yet.</Text>
-          </View>
-        ) : (
-          filteredEntries.map((entry) => (
-            <Pressable
-              key={entry._id}
-              onPress={() => {
-                if (entry.processingVersion === 2) {
-                  onSelectEntry(entry._id);
-                  setView('reading');
-                  return;
-                }
-
-                void handleReadVideo(entry);
-              }}
-              style={[styles.historyItem, { backgroundColor: colors.surface, borderColor: colors.border }]}
-            >
-              <View style={styles.historyItemContent}>
-                <View style={styles.historyTopRow}>
-                  <Text numberOfLines={2} style={[styles.historyItemTitle, { color: colors.text }]}>{entry.title}</Text>
-                  <Pressable onPress={() => handleToggleFavorite(entry._id)} style={styles.historyStarButton}>
-                    <MaterialCommunityIcons color={entry.favorite ? colors.accent : colors.textSoft} name={entry.favorite ? 'star' : 'star-outline'} size={22} />
-                  </Pressable>
-                </View>
-                <View style={styles.historyBadges}>
-                  <View style={[styles.historyBadge, { backgroundColor: colors.backgroundAccent, borderColor: colors.border }]}>
-                    <Text style={[styles.historyBadgeText, { color: colors.text }]}>{entry.targetLanguageLabel}</Text>
-                  </View>
-                  <View style={[styles.historyBadge, { backgroundColor: colors.backgroundAccent, borderColor: colors.border }]}>
-                    <Text style={[styles.historyBadgeText, { color: colors.text }]}>{entry.status}</Text>
-                  </View>
-                </View>
-              </View>
-            </Pressable>
-          ))
-        )}
-      </ScrollView>
-    </SafeAreaView>
-  );
-
-  if (view === 'reading') return renderReadingView();
-  if (view === 'history') return renderHistoryView();
-
-  return (
-    <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background }]}>
-      <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
-        <View style={styles.hero}>
-          <View style={[styles.iconContainer, { backgroundColor: colors.backgroundAccent, borderColor: colors.border }]}>
-            <MaterialCommunityIcons name="book-open-page-variant" size={42} color={colors.accent} />
-          </View>
-          <Text style={[styles.title, { color: colors.text }]}>Bolo Video</Text>
-          <Text style={[styles.subtitle, { color: colors.textSoft }]}>
-            Paste a YouTube link, choose the language, and watch with a synced translation.
-          </Text>
-        </View>
-
-        <View style={[styles.presetRow, { borderColor: colors.border }]}>
-          {languagePresets.map((preset) => {
-            const selected = preset.code === targetLanguage;
-            return (
-              <Pressable
-                key={preset.code}
-                onPress={() => setTargetLanguage(preset.code)}
-                style={[styles.presetButton, { backgroundColor: selected ? colors.accent : colors.surface, borderColor: selected ? colors.accent : colors.border }]}
-              >
-                <Text style={styles.presetFlag}>{preset.flag}</Text>
-                <Text style={[styles.presetLabel, { color: selected ? colors.reader : colors.text }]}>{preset.label}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
-
-        <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          <View style={[styles.cardHeader, { backgroundColor: colors.border }]}>
-            <View style={[styles.stepNumber, { backgroundColor: colors.accent }]}>
-              <Text style={styles.stepNumberText}>1</Text>
-            </View>
-            <Text style={[styles.label, { color: colors.background }]}>Paste Link Below</Text>
-          </View>
-
-          <View style={styles.cardBody}>
-            <TextInput
-              autoCapitalize="none"
-              autoCorrect={false}
-              onChangeText={setUrl}
-              placeholder="Tap here and paste a YouTube link..."
-              placeholderTextColor={colors.textSoft}
-              style={[styles.mainInput, { backgroundColor: colors.backgroundAccent, borderColor: colors.border, color: colors.text }]}
-              value={url}
-            />
-
-            {isPreviewLoading ? (
-              <View style={styles.previewPlaceholder}>
-                <ActivityIndicator color={colors.accent} size="large" />
-                <Text style={[styles.previewPlaceholderText, { color: colors.textSoft }]}>Checking the video...</Text>
-              </View>
-            ) : preview ? (
-              <View style={[styles.previewCard, { borderColor: colors.border, backgroundColor: colors.backgroundAccent }]}>
-                <Image source={{ uri: preview.thumbnailUrl }} style={styles.previewThumb} />
-                <View style={styles.previewInfo}>
-                  <Text numberOfLines={2} style={[styles.previewTitle, { color: colors.text }]}>{preview.title}</Text>
-                  <Text style={[styles.previewAuthor, { color: colors.textSoft }]}>{preview.authorName ?? 'YouTube'}</Text>
-                </View>
-              </View>
-            ) : null}
-
-            <Pressable
-              onPress={() => setPickerVisible(true)}
-              style={[styles.languageCard, { backgroundColor: colors.backgroundAccent, borderColor: colors.border }]}
-            >
-              <View style={styles.languageCardCopy}>
-                <Text style={[styles.languageCardLabel, { color: colors.textSoft }]}>Translate to</Text>
-                <Text style={[styles.languageCardValue, { color: colors.text }]}>{getLanguageLabel(targetLanguage)}</Text>
-              </View>
-              <MaterialCommunityIcons name="chevron-down" size={28} color={colors.text} />
-            </Pressable>
-
-            <View style={styles.buttonContainer}>
-              <Pressable
-                disabled={isWorking}
-                onPress={() => handleReadVideo(null)}
-                style={[styles.bigButton, { backgroundColor: isWorking ? colors.textSoft : colors.accent, borderColor: colors.border }]}
-              >
-                <View style={styles.buttonContent}>
-                  {isWorking ? <ActivityIndicator color="#fff" size="small" /> : null}
-                  <Text style={styles.bigButtonText}>{isWorking ? 'Preparing video...' : '2. Watch with Translation'}</Text>
-                </View>
-              </Pressable>
-              <View style={[styles.buttonShadow, { backgroundColor: colors.border }]} />
-            </View>
-          </View>
-        </View>
-
-        <View style={styles.footer}>
-          <Pressable
-            onPress={() => setView('history')}
-            style={[styles.secondaryButton, { borderColor: colors.border, backgroundColor: colors.background }]}
-          >
-            <MaterialCommunityIcons color={colors.text} name="history" size={24} />
-            <Text style={[styles.secondaryButtonText, { color: colors.text }]}>View saved videos</Text>
+  const supportModal = <Modal visible={supportVisible} onRequestClose={() => onSupportVisibleChange?.(false)} animationType="slide">
+        <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background, padding: 20 }]}>
+          <Pressable accessibilityRole="button" onPress={() => onSupportVisibleChange?.(false)} style={styles.supportButton}>
+            <Text style={{ color: colors.text, fontSize: 22 }}>Close</Text>
           </Pressable>
-        </View>
-      </ScrollView>
+          <Text style={{ color: colors.text, fontSize: 24 }}>Help & diagnostics</Text>
+          <Text style={{ color: colors.text, fontSize: 18, marginVertical: 16 }}>In YouTube, tap Share, then Bolo. You can also copy the link and paste it here.</Text>
+          {shareError && <Text style={{ color: colors.danger }}>{shareError}</Text>}
+          <ScrollView><Text selectable style={{ color: colors.text, fontSize: 16 }}>
+            {syncedDebugReport ? buildDebugReportText(syncedDebugReport) : 'Open a saved video to view its processing details.'}
+          </Text></ScrollView>
+          {syncedDebugReport && <Pressable accessibilityRole="button" style={styles.supportButton}
+            onPress={() => { void Clipboard.setStringAsync(buildDebugReportText(syncedDebugReport)).then(() => Alert.alert('Copied', 'Processing details copied.')).catch(() => Alert.alert('Could not copy', 'Please try again.')); }}>
+            <Text style={{ color: colors.text, fontSize: 18 }}>Copy processing details</Text>
+          </Pressable>}
+        </SafeAreaView>
+      </Modal>;
 
-      <LanguagePickerSheet
-        colors={colors}
-        onClose={() => setPickerVisible(false)}
-        onSelect={(code) => setTargetLanguage(code)}
-        options={targetLanguageOptions}
-        selectedCode={targetLanguage}
-        title="Choose translation language"
-        visible={pickerVisible}
-      />
-    </SafeAreaView>
-  );
+  const library = <View style={[styles.safeArea, { display: view === 'library' ? 'flex' : 'none' }]}>
+    <VideoLibraryScreen entries={entries} loading={entriesLoading} colors={colors} lastEntryId={preferences.lastEntryId}
+      backendReady={backendReady} error={preferences.error} onOpen={openSavedVideo}
+      onFavorite={(id) => { void handleToggleFavorite(id); }} onAdd={() => setView('input')}
+      onHelp={() => onSupportVisibleChange?.(true)} />
+  </View>;
+
+  const renderContent = () => {
+    if (!preferences.loaded) return <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background, justifyContent: 'center' }]}><ActivityIndicator size="large" color={colors.accent} /></SafeAreaView>;
+    if (view === 'reading' && selectedEntry === undefined) return (
+      <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background, padding: 24, justifyContent: 'center' }]}>
+        <ActivityIndicator size="large" color={colors.accent} />
+        <Text style={{ color: colors.text, fontSize: 22 }}>Opening your video…</Text>
+        <Pressable accessibilityRole="button" onPress={() => setView('library')} style={styles.supportButton}>
+          <Text style={{ color: colors.text, fontSize: 20 }}>Back to your videos</Text>
+        </Pressable>
+      </SafeAreaView>
+    );
+    if (view === 'reading' && selectedEntry === null) return (
+      <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background, padding: 24, justifyContent: 'center' }]}>
+        <Text style={{ color: colors.text, fontSize: 22 }}>This saved video is no longer available.</Text>
+        <Pressable accessibilityRole="button" onPress={() => setView('library')} style={styles.supportButton}>
+          <Text style={{ color: colors.text, fontSize: 20 }}>Back to your videos</Text>
+        </Pressable>
+      </SafeAreaView>
+    );
+    if (view === 'reading') return renderReadingView();
+    if (view === 'library') return null;
+
+
+    return (
+      <SafeAreaView style={[styles.safeArea, { backgroundColor: colors.background }]}>
+        <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
+          <Pressable accessibilityRole="button" onPress={() => setView('library')} style={styles.supportButton}>
+            <Text style={[styles.backText, { color: colors.text }]}>‹ Your videos</Text>
+          </Pressable>
+          <View style={styles.hero}>
+            <View style={[styles.iconContainer, { backgroundColor: colors.backgroundAccent, borderColor: colors.border }]}>
+              <MaterialCommunityIcons name="book-open-page-variant" size={42} color={colors.accent} />
+            </View>
+            <Text style={[styles.title, { color: colors.text }]}>Add a video</Text>
+            <Text style={[styles.subtitle, { color: colors.textSoft }]}>
+              Watch your videos with an easy-to-read translation.
+            </Text>
+          </View>
+
+          {preferences.error && <Text style={{ color: colors.danger, fontSize: 18 }}>{preferences.error}</Text>}
+
+
+          <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+            <View style={[styles.cardHeader, { backgroundColor: colors.border }]}>
+              <Text style={[styles.label, { color: colors.background }]}>YouTube link</Text>
+            </View>
+
+            <View style={styles.cardBody}>
+              <TextInput
+                autoCapitalize="none"
+                autoCorrect={false}
+                onChangeText={setUrl}
+                accessibilityLabel="YouTube video link"
+                placeholder="Paste YouTube link"
+                placeholderTextColor={colors.textSoft}
+                style={[styles.mainInput, { backgroundColor: colors.backgroundAccent, borderColor: colors.border, color: colors.text }]}
+                value={url}
+              />
+
+              {isPreviewLoading ? (
+                <View style={styles.previewPlaceholder}>
+                  <ActivityIndicator color={colors.accent} size="large" />
+                  <Text style={[styles.previewPlaceholderText, { color: colors.textSoft }]}>Checking the video...</Text>
+                </View>
+              ) : preview ? (
+                <View style={[styles.previewCard, { borderColor: colors.border, backgroundColor: colors.backgroundAccent }]}>
+                  <Image source={{ uri: preview.thumbnailUrl }} style={styles.previewThumb} />
+                  <View style={styles.previewInfo}>
+                    <Text numberOfLines={2} style={[styles.previewTitle, { color: colors.text }]}>{preview.title}</Text>
+                    <Text style={[styles.previewAuthor, { color: colors.textSoft }]}>{preview.authorName ?? 'YouTube'}</Text>
+                  </View>
+                </View>
+              ) : null}
+
+              <Pressable accessibilityRole="button"
+                onPress={() => setPickerVisible(true)}
+                style={[styles.languageCard, { backgroundColor: colors.backgroundAccent, borderColor: colors.border }]}
+              >
+                <View style={styles.languageCardCopy}>
+                  <Text style={[styles.languageCardLabel, { color: colors.textSoft }]}>Translate to</Text>
+                  <Text style={[styles.languageCardValue, { color: colors.text }]}>{getLanguageLabel(targetLanguage)}</Text>
+                </View>
+                <MaterialCommunityIcons name="chevron-down" size={28} color={colors.text} />
+              </Pressable>
+
+              <View style={styles.buttonContainer}>
+                <Pressable accessibilityRole="button"
+                  disabled={isWorking || !preferences.loaded}
+                  onPress={() => handleReadVideo(null)}
+                  style={[styles.bigButton, { backgroundColor: isWorking ? colors.textSoft : colors.accent, borderColor: colors.border }]}
+                >
+                  <View style={styles.buttonContent}>
+                    {isWorking ? <ActivityIndicator color="#fff" size="small" /> : null}
+                    <Text style={[styles.bigButtonText, { color: colors.reader }]}>{isWorking ? 'Preparing video...' : 'Watch with translation'}</Text>
+                  </View>
+                </Pressable>
+
+              </View>
+            </View>
+          </View>
+
+          <View style={styles.footer}>
+            {onSupportVisibleChange && <Pressable accessibilityRole="button" onPress={() => onSupportVisibleChange(true)} style={styles.supportButton}>
+              <Text style={{ color: colors.textSoft, fontSize: 18 }}>Help & diagnostics</Text>
+            </Pressable>}
+          </View>
+        </ScrollView>
+
+        <LanguagePickerSheet
+          colors={colors}
+          onClose={() => setPickerVisible(false)}
+          onSelect={(code) => setTargetLanguage(code)}
+          options={targetLanguageOptions}
+          selectedCode={targetLanguage}
+          title="Choose translation language"
+          visible={pickerVisible}
+        />
+      </SafeAreaView>
+    );
+  };
+
+  return <View style={styles.safeArea}>
+    {preferences.loaded && library}
+    {renderContent()}
+    {supportModal}
+  </View>;
 }
 
 const styles = StyleSheet.create({
+  supportButton: { minHeight: 48, paddingVertical: 14, paddingHorizontal: 8 },
   backButton: { alignItems: 'center', flexDirection: 'row', gap: 4 },
   backText: { fontSize: 20, fontWeight: '700' },
-  bigButton: { alignItems: 'center', borderRadius: 16, borderWidth: 3, height: 86, justifyContent: 'center', position: 'absolute', width: '100%', zIndex: 1 },
-  bigButtonText: { color: '#FFFFFF', fontSize: 28, fontWeight: '900', letterSpacing: 1 },
-  blockTitle: { fontSize: 24, fontWeight: '900' },
-  bookHero: { gap: spacing.sm, marginBottom: spacing.md },
-  bookWrapper: { gap: spacing.md },
-  buttonContainer: { height: 100, marginTop: spacing.xs, position: 'relative' },
+  bigButton: { alignItems: 'center', borderRadius: 16, borderWidth: 0, minHeight: 72, padding: 16, justifyContent: 'center', width: '100%' },
+  bigButtonText: { color: '#FFFFFF', fontSize: 24, fontWeight: '600', textAlign: 'center' },
+  buttonContainer: { marginTop: spacing.xs },
   buttonContent: { alignItems: 'center', flexDirection: 'row', gap: spacing.xs },
-  buttonShadow: { borderRadius: 16, height: 86, position: 'absolute', top: 8, width: '100%' },
-  card: { borderRadius: 24, borderWidth: 3, overflow: 'hidden' },
+  card: { borderRadius: 24, borderWidth: 1, overflow: 'hidden' },
   cardBody: { gap: spacing.md, padding: spacing.lg },
   cardHeader: { alignItems: 'center', flexDirection: 'row', gap: spacing.sm, padding: spacing.md },
-  chapterCard: { borderRadius: 18, borderWidth: 2, gap: spacing.xs, padding: spacing.md },
-  chapterSummary: { fontSize: 17, lineHeight: 25 },
-  chapterTitle: { fontSize: 19, fontWeight: '800', lineHeight: 26 },
-  chaptersBlock: { gap: spacing.sm },
   container: { flexGrow: 1, padding: spacing.md, paddingBottom: spacing.xl, paddingTop: spacing.xl },
   emptyContainer: { alignItems: 'center', gap: spacing.sm, justifyContent: 'center', paddingVertical: 100 },
   emptyText: { fontSize: 24, fontWeight: '800', textAlign: 'center' },
-  extraBody: { fontSize: 18, lineHeight: 28 },
-  extraCard: { borderRadius: 20, borderWidth: 2, gap: spacing.sm, padding: spacing.md },
-  extraTitle: { fontSize: 22, fontWeight: '800' },
-  extrasSection: { gap: spacing.lg, marginTop: spacing.xl },
   footer: { alignItems: 'center', marginTop: spacing.xl },
-  compactBackButton: {
-    alignItems: 'center',
-    borderRadius: 10,
-    borderWidth: 1,
-    flexDirection: 'row',
-    height: 38,
-    paddingLeft: 4,
-    paddingRight: 10,
-  },
-  compactBackText: { fontSize: 15, fontWeight: '900' },
-  compactIconButton: {
-    alignItems: 'center',
-    borderRadius: 10,
-    borderWidth: 1,
-    height: 38,
-    justifyContent: 'center',
-    width: 38,
-  },
-  glassBtn: { alignItems: 'center', borderRadius: 999, borderWidth: 2, height: 42, justifyContent: 'center', width: 42 },
-  glassBtnText: { fontSize: 16, fontWeight: '800' },
-  glassesControl: { flexDirection: 'row', alignItems: 'center', gap: 6, marginLeft: 'auto' },
   header: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between', padding: spacing.md },
   headerIconBtn: { alignItems: 'center', borderRadius: 12, borderWidth: 2, height: 42, justifyContent: 'center', width: 42 },
-  headerTitle: { fontSize: 20, fontWeight: '800', textTransform: 'uppercase' },
+  headerTitle: { fontSize: 20, fontWeight: '800', textTransform: 'none' },
   hero: { alignItems: 'center', gap: spacing.sm, marginBottom: spacing.xl },
-  historyBadge: { borderRadius: 999, borderWidth: 1, paddingHorizontal: 10, paddingVertical: 6 },
-  historyBadgeText: { fontSize: 12, fontWeight: '800', textTransform: 'uppercase' },
-  historyBadges: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.xs },
-  historyContent: { gap: spacing.md, padding: spacing.md },
-  historyItem: { borderRadius: 20, borderWidth: 3, padding: spacing.md },
-  historyItemContent: { gap: spacing.sm },
-  historyItemTitle: { flex: 1, fontSize: 20, fontWeight: '800', lineHeight: 27 },
-  historySearch: { borderRadius: 16, borderWidth: 3, fontSize: 18, minHeight: 62, paddingHorizontal: spacing.md },
-  historyStarButton: { paddingLeft: spacing.sm },
-  historyTopRow: { alignItems: 'flex-start', flexDirection: 'row' },
-  iconContainer: { alignItems: 'center', borderRadius: 24, borderWidth: 3, height: 80, justifyContent: 'center', marginBottom: spacing.xs, transform: [{ rotate: '-4deg' }], width: 80 },
+  iconContainer: { alignItems: 'center', borderRadius: 24, borderWidth: 1, height: 80, justifyContent: 'center', marginBottom: spacing.xs, transform: [{ rotate: '-4deg' }], width: 80 },
   inlineActionButton: { alignItems: 'center', borderRadius: 14, borderWidth: 2, flexDirection: 'row', gap: 8, justifyContent: 'center', minHeight: 50, paddingHorizontal: spacing.md },
   inlineActionText: { color: '#fff', fontSize: 16, fontWeight: '800' },
   label: { fontSize: 22, fontWeight: '800' },
-  languageCard: { alignItems: 'center', borderRadius: 16, borderWidth: 3, flexDirection: 'row', justifyContent: 'space-between', minHeight: 76, paddingHorizontal: spacing.md },
+  languageCard: { alignItems: 'center', borderRadius: 16, borderWidth: 1, flexDirection: 'row', justifyContent: 'space-between', minHeight: 76, paddingHorizontal: spacing.md },
   languageCardCopy: { gap: 4 },
-  languageCardLabel: { fontSize: 14, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase' },
+  languageCardLabel: { fontSize: 14, fontWeight: '700', letterSpacing: 0.4, textTransform: 'none' },
   languageCardValue: { fontSize: 22, fontWeight: '800' },
-  mainInput: { borderRadius: 16, borderWidth: 3, fontSize: 20, minHeight: 70, padding: spacing.md },
-  metaRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginTop: spacing.sm },
-  modeChip: { borderRadius: 999, borderWidth: 2, minHeight: 44, justifyContent: 'center', paddingHorizontal: spacing.md },
-  modeChipText: { fontSize: 15, fontWeight: '800' },
-  modeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
-  noticeCard: { alignItems: 'flex-start', borderRadius: 18, borderWidth: 2, flexDirection: 'row', gap: spacing.sm, padding: spacing.md, marginTop: spacing.sm },
-  noticeText: { flex: 1, fontSize: 16, lineHeight: 24 },
-  presetButton: { alignItems: 'center', borderRadius: 16, borderWidth: 2, flex: 1, gap: 6, justifyContent: 'center', minHeight: 68, paddingHorizontal: 8 },
-  presetFlag: { fontSize: 20 },
-  presetLabel: { fontSize: 14, fontWeight: '800' },
-  presetRow: { flexDirection: 'row', gap: spacing.sm, marginBottom: spacing.lg },
+  mainInput: { borderRadius: 16, borderWidth: 1, fontSize: 20, minHeight: 70, padding: spacing.md },
   previewAuthor: { fontSize: 18, fontWeight: '600' },
   previewCard: { alignItems: 'center', borderRadius: 16, borderWidth: 2, flexDirection: 'row', gap: spacing.sm, overflow: 'hidden', padding: spacing.sm },
   previewInfo: { flex: 1, gap: 2 },
@@ -616,29 +498,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: spacing.xl,
   },
-  readerBottomPad: { height: 220 },
   readerHeaderTools: { alignItems: 'center', flexDirection: 'row', gap: spacing.xs },
-  readingContainer: { flex: 1 },
-  readingContent: { padding: spacing.md },
   safeArea: { flex: 1 },
-  secondaryButton: { alignItems: 'center', borderRadius: 16, borderWidth: 3, flexDirection: 'row', gap: spacing.sm, paddingHorizontal: spacing.xl, paddingVertical: spacing.sm },
+  secondaryButton: { alignItems: 'center', borderRadius: 16, borderWidth: 1, flexDirection: 'row', gap: spacing.sm, paddingHorizontal: spacing.xl, paddingVertical: spacing.sm },
   secondaryButtonText: { fontSize: 18, fontWeight: '700' },
-  secondaryToolButton: { alignItems: 'center', borderRadius: 16, borderWidth: 3, flexDirection: 'row', gap: 8, height: 60, justifyContent: 'center', paddingHorizontal: spacing.md },
-  secondaryToolButtonText: { fontSize: 16, fontWeight: '800' },
   statusTitle: { fontSize: 24, fontWeight: '800', textAlign: 'center' },
   statusBody: { fontSize: 16, fontWeight: '600', lineHeight: 24, textAlign: 'center' },
-  statusWrap: { alignItems: 'center', flex: 1, gap: spacing.sm, justifyContent: 'center' },
   stepNumber: { alignItems: 'center', borderRadius: 8, height: 32, justifyContent: 'center', width: 32 },
   stepNumberText: { color: '#FFF', fontSize: 18, fontWeight: '900' },
-  stickyToolbelt: { gap: spacing.md, paddingBottom: spacing.lg, paddingHorizontal: spacing.md, paddingTop: spacing.md },
-  syncedEmptyState: { alignItems: 'center', flex: 1, gap: spacing.sm, justifyContent: 'center', padding: spacing.md },
   subtitle: { fontSize: isSmallDevice ? 18 : 22, lineHeight: 30, paddingHorizontal: spacing.md, textAlign: 'center' },
-  textContainer: { borderRadius: 20, borderWidth: 3, minHeight: 360, padding: spacing.lg },
   title: { fontSize: isSmallDevice ? 32 : 44, fontWeight: '900', letterSpacing: -1, textAlign: 'center' },
-  toolButton: { alignItems: 'center', borderRadius: 16, borderWidth: 3, flex: 1, flexDirection: 'row', gap: 8, height: 74, justifyContent: 'center' },
-  toolButtonText: { color: '#FFF', fontSize: 20, fontWeight: '900' },
-  toolbeltLabel: { fontSize: 14, fontWeight: '800', letterSpacing: 1.2, textAlign: 'center', textTransform: 'uppercase' },
-  toolbeltRow: { flexDirection: 'row', gap: spacing.sm },
-  transcriptText: { fontWeight: '500' },
-  videoTitle: { fontSize: 32, fontWeight: '900', lineHeight: 40 },
 });

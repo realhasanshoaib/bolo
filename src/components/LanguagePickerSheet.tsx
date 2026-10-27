@@ -1,4 +1,4 @@
-import { Modal, Pressable, ScrollView, StyleSheet, Text } from 'react-native';
+import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { languageOptions } from '../constants/languages';
 import { spacing } from '../constants/theme';
 
@@ -28,11 +28,12 @@ export function LanguagePickerSheet({
 }) {
   return (
     <Modal animationType="slide" onRequestClose={onClose} transparent visible={visible}>
-      <Pressable onPress={onClose} style={styles.backdrop}>
-        <Pressable
-          onPress={() => undefined}
-          style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}
-        >
+      <View style={styles.backdrop}>
+        <Pressable accessible={false} onPress={onClose} style={StyleSheet.absoluteFill} />
+        <View accessibilityViewIsModal style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <Pressable accessibilityRole="button" onPress={onClose} style={{ minHeight: 48, justifyContent: 'center' }}>
+            <Text style={{ color: colors.text, fontSize: 20 }}>Close</Text>
+          </Pressable>
           <Text style={[styles.title, { color: colors.text }]}>{title}</Text>
           <Text style={[styles.subtitle, { color: colors.textSoft }]}>
             Choose the language that will make the reading experience easiest.
@@ -43,7 +44,7 @@ export function LanguagePickerSheet({
               const selected = language.code === selectedCode;
 
               return (
-                <Pressable
+                <Pressable accessibilityRole="button" accessibilityState={{ selected }} accessibilityLabel={language.label}
                   key={language.code}
                   onPress={() => {
                     onSelect(language.code);
@@ -65,8 +66,8 @@ export function LanguagePickerSheet({
               );
             })}
           </ScrollView>
-        </Pressable>
-      </Pressable>
+        </View>
+      </View>
     </Modal>
   );
 }

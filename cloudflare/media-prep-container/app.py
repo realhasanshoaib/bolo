@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -242,7 +243,6 @@ def prepare_media(payload: dict[str, Any]) -> dict[str, Any]:
           remaining_ms = max(total_duration_ms - start_ms, 0)
           duration_ms = min(nominal_chunk_ms, remaining_ms) if remaining_ms else nominal_chunk_ms
           r2_key = str(entry_prefix / f"{index:05d}.mp3")
-          upload_chunk(chunk_path, r2_key, entry_prefix)
 
           chunks.append(
               {
@@ -257,6 +257,15 @@ def prepare_media(payload: dict[str, Any]) -> dict[str, Any]:
           )
           start_ms += duration_ms
 
+      upload_started_at = time.monotonic()
+      with ThreadPoolExecutor(max_workers=4) as uploads:
+          futures = [
+              uploads.submit(upload_chunk, chunk_path, chunk["r2Key"], entry_prefix)
+              for chunk_path, chunk in zip(chunk_paths, chunks)
+          ]
+          for future in futures:
+              future.result()
+      upload_sec = time.monotonic() - upload_started_at
       total_sec = time.monotonic() - started_at
 
       return {
@@ -266,6 +275,7 @@ def prepare_media(payload: dict[str, Any]) -> dict[str, Any]:
           "durationSec": duration_sec,
           "ffmpegSec": ffmpeg_sec,
           "totalSec": total_sec,
+          "uploadSec": upload_sec,
       }
     finally:
       shutil.rmtree(workdir, ignore_errors=True)

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Alert } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { ConvexProvider, ConvexReactClient, useMutation, useQuery } from 'convex/react';
@@ -7,7 +7,6 @@ import { api } from './convex/_generated/api';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { parseYouTubeUrl } from './src/lib/youtube';
 import {
-  splitDisplaySegmentsForCaptions,
   type DisplayTranscriptSegment,
   type ProcessingDebugReport,
 } from './src/lib/syncedTranscript';
@@ -19,10 +18,12 @@ const emptySyncedSegments: DisplayTranscriptSegment[] = [];
 
 function ConnectedApp() {
   const [isWorking, setIsWorking] = useState(false);
+  const [supportVisible, setSupportVisible] = useState(false);
   const [selectedEntryId, setSelectedEntryId] = useState<Id<'entries'> | null>(null);
-  const migrationStartedRef = useRef(false);
-  const entries = useQuery(api.entries.listEntries) ?? [];
-  const selectedEntry = entries.find((entry) => entry._id === selectedEntryId) ?? entries[0] ?? null;
+  const queriedEntries = useQuery(api.entries.listEntries);
+  const entries = queriedEntries ?? [];
+  const queriedSelectedEntry = useQuery(api.entries.getEntry, selectedEntryId ? { entryId: selectedEntryId } : 'skip');
+  const selectedEntry = selectedEntryId ? queriedSelectedEntry : entries[0] ?? null;
   const selectedEntryIsSynced = selectedEntry?.processingVersion === 2;
   const queriedSyncedSegments = useQuery(
     api.entries.listEntrySegments,
@@ -30,33 +31,16 @@ function ConnectedApp() {
   );
   const debugInfo = useQuery(
     api.entries.getEntryDebugInfo,
-    selectedEntryId && selectedEntryIsSynced ? { entryId: selectedEntryId } : 'skip',
+    supportVisible && selectedEntryId && selectedEntryIsSynced ? { entryId: selectedEntryId } : 'skip',
   );
   const queueSyncedEntry = useMutation(api.entries.queueSyncedEntry);
-  const startMay16Migration = useMutation(api.entries.startMay16Migration);
   const toggleFavorite = useMutation(api.entries.toggleFavorite);
 
-  useEffect(() => {
-    if (migrationStartedRef.current) {
-      return;
-    }
-
-    migrationStartedRef.current = true;
-    void startMay16Migration().catch(() => undefined);
-  }, [startMay16Migration]);
-
   const mappedSyncedSegments = useMemo<DisplayTranscriptSegment[]>(
-    () =>
-      splitDisplaySegmentsForCaptions({
-        segments: (queriedSyncedSegments ?? emptySyncedSegments).map((segment) => ({
-          endMs: segment.endMs,
-          index: segment.index,
-          originalText: segment.originalText,
-          sourceChunkIndexes: segment.sourceChunkIndexes,
-          startMs: segment.startMs,
-          translatedText: segment.translatedText,
-        })),
-      }),
+    () => (queriedSyncedSegments ?? emptySyncedSegments).map((segment) => ({
+      endMs: segment.endMs, index: segment.index, originalText: segment.originalText,
+      sourceChunkIndexes: segment.sourceChunkIndexes, startMs: segment.startMs, translatedText: segment.translatedText,
+    })),
     [queriedSyncedSegments],
   );
 
@@ -100,6 +84,8 @@ function ConnectedApp() {
       timings: {
         downloadSec: latestRun?.downloadSec,
         ffmpegSec: latestRun?.ffmpegSec,
+        uploadSec: latestRun?.uploadSec,
+        firstTranslationSec: selectedEntry.firstTranslationAt && latestRun ? (selectedEntry.firstTranslationAt - latestRun.startedAt) / 1000 : undefined,
         totalSec: latestRun?.totalSec,
         translationSec: latestRun?.translationSec,
         whisperSec: latestRun?.whisperSec,
@@ -116,6 +102,7 @@ function ConnectedApp() {
     <HomeScreen
       backendReady
       entries={entries}
+      entriesLoading={queriedEntries === undefined}
       isWorking={isWorking}
       onSelectEntry={handleSelectEntry}
       onToggleFavorite={async (entryId) => {
@@ -158,7 +145,10 @@ function ConnectedApp() {
         }
       }}
       selectedEntryId={selectedEntryId}
+      selectedEntry={selectedEntry}
       syncedDebugReport={syncedDebugReport}
+      supportVisible={supportVisible}
+      onSupportVisibleChange={setSupportVisible}
       syncedSegments={mappedSyncedSegments}
     />
   );
@@ -181,6 +171,7 @@ export default function App() {
           onToggleFavorite={async () => undefined}
           onTranscribe={async () => null}
           selectedEntryId={null}
+          selectedEntry={null}
           syncedSegments={[]}
         />
       )}

@@ -3,6 +3,7 @@ import { internalMutation, internalQuery, mutation, query, type MutationCtx } fr
 import type { Id } from './_generated/dataModel';
 import { v } from 'convex/values';
 import { workflow } from './workflow';
+import { firstIncompleteChunk } from '../src/lib/syncedTranscript';
 
 const chapterValidator = v.array(
   v.object({
@@ -109,18 +110,28 @@ const isActiveProcessingAttempt = async (
 
 export const listEntries = query({
   args: {},
-  handler: async (ctx) => ctx.db.query('entries').order('desc').take(50),
+  handler: async (ctx) => ctx.db.query('entries').withIndex('by_updated').order('desc').take(50),
+});
+
+export const getEntry = query({
+  args: { entryId: v.string() },
+  handler: async (ctx, args) => {
+    const entryId = ctx.db.normalizeId('entries', args.entryId);
+    return entryId ? await ctx.db.get(entryId) : null;
+  },
 });
 
 export const listEntrySegments = query({
-  args: {
-    entryId: v.id('entries'),
+  args: { entryId: v.id('entries') },
+  handler: async (ctx, args) => {
+    const [entry, segments] = await Promise.all([
+      ctx.db.get(args.entryId),
+      ctx.db.query('entrySegments').withIndex('by_entry_index', (q) => q.eq('entryId', args.entryId)).collect(),
+    ]);
+    if (entry?.translatedChunkIndexes === undefined) return segments;
+    const visibleThroughChunk = firstIncompleteChunk(entry.translatedChunkIndexes);
+    return segments.filter((segment) => segment.sourceChunkIndexes.every((index) => index <= visibleThroughChunk));
   },
-  handler: async (ctx, args) =>
-    ctx.db
-      .query('entrySegments')
-      .withIndex('by_entry_index', (queryBuilder) => queryBuilder.eq('entryId', args.entryId))
-      .collect(),
 });
 
 export const getEntryDebugInfo = query({
@@ -238,6 +249,18 @@ export const queueSyncedEntry = mutation({
   },
   returns: v.id('entries'),
   handler: async (ctx, args) => {
+    const existing = await ctx.db.query('entries')
+      .withIndex('by_video_language', (q) => q.eq('videoId', args.videoId).eq('targetLanguage', args.targetLanguage))
+      .order('desc')
+      .filter((q) => q.and(
+        q.eq(q.field('processingVersion'), 2),
+        q.eq(q.field('sourceLanguage'), args.sourceLanguage),
+        q.or(q.eq(q.field('status'), 'ready'), q.eq(q.field('status'), 'queued'), q.eq(q.field('status'), 'processing')),
+      )).first();
+    if (existing) {
+      await ctx.db.patch(existing._id, { updatedAt: args.updatedAt });
+      return existing._id;
+    }
     const attemptId = createProcessingAttemptId();
     const entryId = await ctx.db.insert('entries', {
       ...args,
@@ -246,6 +269,7 @@ export const queueSyncedEntry = mutation({
       processingVersion: 2,
       status: 'queued',
       translationStatus: 'pending',
+      translatedChunkIndexes: [],
     });
 
     await workflow.start(ctx, internal.syncedVideoWorkflow.processSyncedVideo, {
@@ -372,6 +396,7 @@ export const completeProcessingRun = internalMutation({
     entryId: v.id('entries'),
     attemptId: v.optional(v.string()),
     ffmpegSec: v.optional(v.number()),
+    uploadSec: v.optional(v.number()),
     realtimeFactor: v.optional(v.number()),
     totalSec: v.optional(v.number()),
     translationSec: v.optional(v.number()),
@@ -392,6 +417,7 @@ export const completeProcessingRun = internalMutation({
       completedAt: args.completedAt,
       downloadSec: args.downloadSec,
       ffmpegSec: args.ffmpegSec,
+      uploadSec: args.uploadSec,
       realtimeFactor: args.realtimeFactor,
       status: 'ready',
       totalSec: args.totalSec,
@@ -682,6 +708,10 @@ export const replaceEntrySegments = internalMutation({
   handler: async (ctx, args) => {
     if (!(await isActiveProcessingAttempt(ctx, args))) return;
 
+    if (args.segments.length === 0) {
+      await ctx.db.patch(args.entryId, { translatedChunkIndexes: [], firstTranslationAt: undefined });
+    }
+
     const existing = await ctx.db
       .query('entrySegments')
       .withIndex('by_entry', (queryBuilder) => queryBuilder.eq('entryId', args.entryId))
@@ -697,6 +727,49 @@ export const replaceEntrySegments = internalMutation({
         }),
       ),
     );
+  },
+});
+
+async function markFirstVisibleTranslation(ctx: MutationCtx, args: { entryId: Id<'entries'>; createdAt: number }) {
+  const entry = await ctx.db.get(args.entryId);
+  if (!entry || entry.firstTranslationAt !== undefined) return;
+  const first = await ctx.db.query('entrySegments').withIndex('by_entry_index', (q) => q.eq('entryId', args.entryId)).first();
+  const visibleThroughChunk = firstIncompleteChunk(entry.translatedChunkIndexes ?? []);
+  if (first && first.sourceChunkIndexes.every((index) => index <= visibleThroughChunk)) {
+    await ctx.db.patch(args.entryId, { firstTranslationAt: args.createdAt });
+  }
+}
+
+export const completeTranslationChunk = internalMutation({
+  args: { entryId: v.id('entries'), attemptId: v.optional(v.string()), chunkIndex: v.number(), createdAt: v.number() },
+  handler: async (ctx, args) => {
+    if (!(await isActiveProcessingAttempt(ctx, args))) return;
+    const entry = await ctx.db.get(args.entryId);
+    if (entry?.status !== 'processing') return;
+    const translatedChunkIndexes = [...new Set([...(entry.translatedChunkIndexes ?? []), args.chunkIndex])].sort((a, b) => a - b);
+    await ctx.db.patch(args.entryId, { translatedChunkIndexes });
+    await markFirstVisibleTranslation(ctx, args);
+  },
+});
+
+export const publishEntrySegments = internalMutation({
+  args: {
+    createdAt: v.number(), entryId: v.id('entries'),
+    attemptId: v.optional(v.string()), segments: v.array(segmentValidator),
+  },
+  handler: async (ctx, args) => {
+    if (!(await isActiveProcessingAttempt(ctx, args))) return;
+    const activeEntry = await ctx.db.get(args.entryId);
+    if (activeEntry?.status !== 'processing') return;
+    for (const segment of args.segments) {
+      const existing = await ctx.db.query('entrySegments')
+        .withIndex('by_entry_index', (q) => q.eq('entryId', args.entryId).eq('index', segment.index)).unique();
+      const value = { ...segment, entryId: args.entryId, createdAt: args.createdAt };
+      if (existing) await ctx.db.replace(existing._id, value);
+      else await ctx.db.insert('entrySegments', value);
+    }
+    await markFirstVisibleTranslation(ctx, args);
+
   },
 });
 

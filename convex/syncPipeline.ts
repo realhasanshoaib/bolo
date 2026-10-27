@@ -73,7 +73,7 @@ const createJobId = () =>
 const DEFAULT_FETCH_TIMEOUT_MS = 120_000;
 const MEDIA_PREP_TIMEOUT_MS = 6.5 * 60_000;
 const WHISPER_TIMEOUT_MS = 6 * 60_000;
-const TRANSLATION_TIMEOUT_MS = 90_000;
+const TRANSLATION_TIMEOUT_MS = 30_000;
 const TRANSLATION_MAX_OUTPUT_TOKENS = 2_500;
 const MEDIA_PREP_CHUNK_SECONDS = 60;
 
@@ -171,6 +171,7 @@ export const prepareMedia = internalAction({
     durationSec: v.number(),
     ffmpegSec: v.number(),
     totalSec: v.number(),
+    uploadSec: v.optional(v.number()),
   }),
   handler: async (ctx, args) => {
     const mediaPrepUrl = requireEnv('BOLO_MEDIA_PREP_URL');
@@ -204,6 +205,7 @@ export const prepareMedia = internalAction({
       durationSec: number;
       ffmpegSec: number;
       totalSec: number;
+      uploadSec?: number;
     };
 
     try {
@@ -451,7 +453,8 @@ export const translateSegmentBatch = internalAction({
   handler: async (ctx, args) => {
     const startedAt = Date.now();
     const apiKey = requireEnv('OPENROUTER_API_KEY');
-    const model = process.env.OPENROUTER_TRANSLATION_MODEL ?? 'google/gemma-4-31b-it';
+    const model =
+      process.env.OPENROUTER_TRANSLATION_MODEL ?? 'google/gemini-3.1-flash-lite';
     const provider = createOpenRouter({ apiKey });
     const items = args.segments.map((segment) => ({
       id: String(segment.index),
@@ -461,10 +464,16 @@ export const translateSegmentBatch = internalAction({
     try {
       const { providerMetadata, text, usage } = await generateText({
         maxOutputTokens: TRANSLATION_MAX_OUTPUT_TOKENS,
+        maxRetries: 0,
         model: provider(model, {
+          extraBody: {
+            reasoning: {
+              effort: 'minimal',
+            },
+          },
           provider: {
-            allow_fallbacks: false,
-            order: ['cerebras'],
+            allow_fallbacks: true,
+            data_collection: 'deny',
           },
           usage: {
             include: true,
@@ -499,7 +508,7 @@ export const translateSegmentBatch = internalAction({
         event: {
           completionTokens: usage.outputTokens,
           estimatedCostUsd: openRouterUsage?.cost,
-          metadata: JSON.stringify({ totalTokens: openRouterUsage?.totalTokens }),
+          metadata: JSON.stringify({ totalTokens: openRouterUsage?.totalTokens, elapsedSec: (Date.now() - startedAt) / 1000 }),
           model,
           promptTokens: usage.inputTokens,
           provider: 'openrouter',

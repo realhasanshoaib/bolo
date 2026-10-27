@@ -37,6 +37,8 @@ export type ProcessingDebugReport = {
   timings?: {
     downloadSec?: number;
     ffmpegSec?: number;
+    uploadSec?: number;
+    firstTranslationSec?: number;
     totalSec?: number;
     translationSec?: number;
     whisperSec?: number;
@@ -471,10 +473,12 @@ export const buildDebugReportText = (report: ProcessingDebugReport) => {
       : `FFmpeg: ${report.timings.ffmpegSec.toFixed(1)}s`,
     report.timings?.whisperSec === undefined
       ? null
-      : `Whisper: ${report.timings.whisperSec.toFixed(1)}s`,
+      : `Whisper requests (sum): ${report.timings.whisperSec.toFixed(1)}s`,
     report.timings?.translationSec === undefined
       ? null
-      : `Translation: ${report.timings.translationSec.toFixed(1)}s`,
+      : `Translation requests (sum): ${report.timings.translationSec.toFixed(1)}s`,
+    report.timings?.uploadSec === undefined ? undefined : `Audio uploads: ${report.timings.uploadSec.toFixed(1)}s`,
+    report.timings?.firstTranslationSec === undefined ? undefined : `First translation: ${report.timings.firstTranslationSec.toFixed(1)}s`,
     report.timings?.totalSec === undefined
       ? null
       : `Total: ${report.timings.totalSec.toFixed(1)}s`,
@@ -491,3 +495,16 @@ export const buildDebugReportText = (report: ProcessingDebugReport) => {
 
   return lines.filter(Boolean).join('\n');
 };
+
+// Stable ranges let chunks finish independently without renumbering visible text.
+export function indexChunkSegments(chunkIndex: number, segments: DisplayTranscriptSegment[]) {
+  if (segments.length >= 10_000) throw new Error('Too many sentences in an audio chunk.');
+  return segments.map((segment, index) => ({ ...segment, index: chunkIndex * 10_000 + index }));
+}
+
+export function firstIncompleteChunk(completedChunkIndexes: number[]) {
+  const completed = new Set(completedChunkIndexes);
+  let index = 0;
+  while (completed.has(index)) index += 1;
+  return index;
+}

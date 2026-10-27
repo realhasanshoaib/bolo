@@ -157,7 +157,8 @@ const translateTranscript = async ({
   }
 
   const apiKey = process.env.OPENROUTER_API_KEY;
-  const model = process.env.OPENROUTER_TRANSLATION_MODEL ?? 'google/gemma-4-31b-it';
+  const model =
+    process.env.OPENROUTER_TRANSLATION_MODEL ?? 'google/gemini-3.1-flash-lite';
 
   if (!apiKey) {
     throw new Error('Missing OPENROUTER_API_KEY in Convex environment variables.');
@@ -169,9 +170,14 @@ const translateTranscript = async ({
   for (const chunk of splitForTranslation(transcriptText)) {
     const { text } = await generateText({
       model: provider(model, {
+        extraBody: {
+          reasoning: {
+            effort: 'minimal',
+          },
+        },
         provider: {
-          allow_fallbacks: false,
-          order: ['cerebras'],
+          allow_fallbacks: true,
+          data_collection: 'deny',
         },
       }),
       prompt: [
@@ -205,9 +211,14 @@ const buildReaderExtras = async ({
   try {
     const { text } = await generateText({
       model: provider(model, {
+        extraBody: {
+          reasoning: {
+            effort: 'minimal',
+          },
+        },
         provider: {
-          allow_fallbacks: false,
-          order: ['cerebras'],
+          allow_fallbacks: true,
+          data_collection: 'deny',
         },
       }),
       prompt: [
@@ -265,7 +276,8 @@ export const processEntry = action({
   handler: async (ctx, args) => {
     const { videoId } = parseYouTubeUrl(args.youtubeUrl);
     const apiKey = process.env.OPENROUTER_API_KEY;
-    const model = process.env.OPENROUTER_TRANSLATION_MODEL ?? 'google/gemma-4-31b-it';
+    const model =
+      process.env.OPENROUTER_TRANSLATION_MODEL ?? 'google/gemini-3.1-flash-lite';
 
     try {
       await ctx.runMutation(internal.entries.updateProgress, {
